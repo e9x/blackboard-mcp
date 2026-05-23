@@ -29,7 +29,6 @@ from blackboard.auth import (
     NotConfiguredError,
     clear_cookie_cache,
     interactive_login,
-    load_cached_cookies,
 )
 from blackboard.client import BlackboardClient
 
@@ -489,7 +488,6 @@ async def get_due_dates(days_ahead: int = 14) -> str:
 
     courses = await client.get_courses()
     cutoff = datetime.now(timezone.utc) + timedelta(days=days_ahead)
-    now = datetime.now(timezone.utc)
 
     upcoming = []
     for course in courses:

@@ -17,13 +17,13 @@ import stat
 import sys
 from pathlib import Path
 
+from config import settings
+
 try:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
-
-from config import settings
 
 
 # ──────────────────────────────────────────────

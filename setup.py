@@ -369,8 +369,6 @@ def _write_mcp_config(config_path: Path, server_name: str, entry: dict) -> None:
         except Exception:
             config = {}
 
-    name_lower = config_path.parts[-1]
-
     # Zed uses a different key and schema
     if "zed" in str(config_path).lower():
         config.setdefault("context_servers", {})[server_name] = {
@@ -388,8 +386,6 @@ def _write_mcp_config(config_path: Path, server_name: str, entry: dict) -> None:
 
 
 def do_claude_config(base_url: str) -> None:
-    import os
-
     # Derive a server name from the URL (e.g. "blackboard-cdu", "blackboard-uq")
     hostname = base_url.split("//")[-1].split("/")[0]
     parts = hostname.replace("www.", "").split(".")
