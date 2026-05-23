@@ -12,17 +12,36 @@ What it does:
   2. Auto-detects Blackboard Ultra vs Classic interface
   3. Opens a real browser — you log in as normal (works with any SSO / MFA)
   4. Tests the connection and lists your courses
-  5. Optionally saves credentials to macOS Keychain for auto-relogin
-  6. Auto-configures Claude Desktop
+  5. Optionally saves credentials to the OS keychain for silent auto-relogin
+  6. Auto-configures all detected AI coding assistants
 """
 from __future__ import annotations
 
 import asyncio
 import getpass
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+# ── Auto-bootstrap: create .venv and re-exec inside it if needed ─────────────
+if os.environ.get("_BB_MCP_VENV") != "1":
+    _HERE = Path(__file__).parent.resolve()
+    _VENV = _HERE / ".venv"
+    _VENV_PY = _VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python3")
+    import subprocess as _sp
+    if not _VENV_PY.exists():
+        print("Setting up environment (one-time, ~1 minute)...", flush=True)
+        _sp.check_call([sys.executable, "-m", "venv", str(_VENV)])
+        _sp.check_call([str(_VENV_PY), "-m", "pip", "install", "-q", "-r",
+                        str(_HERE / "requirements.txt")])
+        print("Downloading browser for login (one-time, ~150MB)...", flush=True)
+        _sp.check_call([str(_VENV_PY), "-m", "playwright", "install", "chromium"])
+    env = os.environ.copy()
+    env["_BB_MCP_VENV"] = "1"
+    sys.exit(_sp.call([str(_VENV_PY)] + sys.argv, env=env))
+# ─────────────────────────────────────────────────────────────────────────────
 
 from rich.console import Console
 from rich.panel import Panel
@@ -35,17 +54,12 @@ PROJECT_DIR = Path(__file__).parent
 PYTHON = sys.executable
 ENV_FILE = PROJECT_DIR / ".env"
 
-# ── Known university Blackboard URLs (for autocomplete hints) ─────────────────
+# ── Known university Blackboard URLs (for reference hints only) ───────────────
 KNOWN_UNIVERSITIES: dict[str, str] = {
     "cdu":        "https://online.cdu.edu.au",
-    "uq":         "https://learn.uq.edu.au",
-    "unsw":       "https://moodle.telt.unsw.edu.au",   # UNSW uses Moodle
-    "uwa":        "https://lms.uwa.edu.au",
-    "anu":        "https://wattlecourses.anu.edu.au",
-    "usyd":       "https://canvas.sydney.edu.au",       # Sydney uses Canvas
-    "deakin":     "https://d2l.deakin.edu.au",
     "latrobe":    "https://latrobe.blackboard.com",
     "federation": "https://federation.edu.au/blackboard",
+    "uwa":        "https://lms.uwa.edu.au",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,7 +69,7 @@ def banner() -> None:
     console.print()
     console.print(Panel.fit(
         "[bold cyan]Blackboard MCP — Setup Wizard[/bold cyan]\n"
-        "[dim]Connect Claude to your university Blackboard account[/dim]",
+        "[dim]Connect any AI assistant to your university Blackboard account[/dim]",
         border_style="cyan",
         padding=(1, 4),
     ))
@@ -102,7 +116,7 @@ async def do_university_setup() -> tuple[str, str]:
             return existing_url, interface
 
     console.print("  Enter your university's Blackboard URL.")
-    console.print("  [dim]Examples:  https://online.cdu.edu.au  |  https://blackboard.myuni.edu.au[/dim]")
+    console.print("  [dim]Examples:  https://blackboard.myuniversity.edu  |  https://learn.myuni.edu.au[/dim]")
     console.print()
 
     while True:
@@ -189,8 +203,7 @@ async def do_login(interface: str) -> dict[str, str]:
     console.print("  A browser window will open — [bold]log in as you normally would.[/bold]")
     console.print("  Works with any SSO, Microsoft, Shibboleth, Google, or MFA.")
     console.print()
-    info("Complete the login in the browser. The wizard will detect it automatically.")
-    console.print()
+    info("Complete the login in the browser. The wizard will detect it and close the browser automatically.")
 
     cookies = await interactive_login()
     return cookies
@@ -249,9 +262,9 @@ def do_keychain() -> None:
     info("When your session expires, a browser window will open and you log in again.")
     info("Nothing is stored. Simple and secure.")
     console.print()
-    console.print("  [bold]Option B[/bold] — [cyan]Save password in macOS Keychain[/cyan]")
+    console.print("  [bold]Option B[/bold] — [cyan]Save password in system keychain[/cyan]")
     info("Fully silent background relogin \u2014 no browser popup ever.")
-    info("Password is stored by macOS Keychain, not in any file.")
+    info("Password stored by OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret Service).")
     console.print()
 
     save = Confirm.ask(
@@ -267,7 +280,7 @@ def do_keychain() -> None:
         from blackboard.auth import save_credentials_to_keychain
         ok = save_credentials_to_keychain(username.strip(), password.strip())
         if ok:
-            success("Password saved to macOS Keychain \u2014 relogin will be fully automatic.")
+            success("Password saved to system keychain \u2014 relogin will be fully automatic.")
             info("To remove it later:  python3 setup.py --reset")
         else:
             warn("Keychain save failed \u2014 browser will reopen when your session expires.")
@@ -279,30 +292,106 @@ def do_keychain() -> None:
 #  Step 5 — Configure Claude Desktop
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known MCP client config file locations on macOS
-MCP_CLIENTS: list[tuple[str, Path]] = [
-    (
-        "Claude Desktop",
-        Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json",
-    ),
-    (
-        "Claude Code",
-        Path.home() / ".claude" / "claude_desktop_config.json",
-    ),
-    (
-        "Cursor",
-        Path.home() / ".cursor" / "mcp.json",
-    ),
-    (
-        "Windsurf",
-        Path.home() / ".codeium" / "windsurf" / "mcp_config.json",
-    ),
-]
+# ── MCP client config locations ──────────────────────────────────────────────
+#
+# Each entry: (display_name, config_path, config_format)
+#
+# config_format:
+#   "mcpServers"  → {"mcpServers": {"name": {entry}}}   (Claude Desktop / Code / Cursor / Zed)
+#   "mcpServers"  is the same JSON shape for all clients below — only the file path differs.
+#
+# Paths are checked per OS in _get_mcp_clients().
+
+def _get_mcp_clients() -> list[tuple[str, Path]]:
+    """Return (name, config_path) for every MCP client, filtered to the current OS."""
+    H = Path.home()
+    OS = sys.platform  # "darwin", "linux", "win32"
+
+    clients: list[tuple[str, Path]] = []
+
+    # ── Claude Desktop ────────────────────────────────────────────────────────
+    if OS == "darwin":
+        clients.append(("Claude Desktop", H / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"))
+    elif OS == "win32":
+        appdata = Path(os.environ.get("APPDATA", H / "AppData" / "Roaming"))
+        clients.append(("Claude Desktop", appdata / "Claude" / "claude_desktop_config.json"))
+    else:  # Linux / WSL
+        clients.append(("Claude Desktop", H / ".config" / "Claude" / "claude_desktop_config.json"))
+
+    # ── Claude Code (CLI) — single-file config at ~/.claude.json ─────────────
+    clients.append(("Claude Code", H / ".claude.json"))
+
+    # ── Cursor ────────────────────────────────────────────────────────────────
+    clients.append(("Cursor", H / ".cursor" / "mcp.json"))
+
+    # ── Windsurf ──────────────────────────────────────────────────────────────
+    clients.append(("Windsurf", H / ".codeium" / "windsurf" / "mcp_config.json"))
+
+    # ── Zed ───────────────────────────────────────────────────────────────────
+    if OS == "darwin":
+        clients.append(("Zed", H / "Library" / "Application Support" / "Zed" / "settings.json"))
+    elif OS == "linux":
+        clients.append(("Zed", H / ".config" / "zed" / "settings.json"))
+
+    # ── Codex CLI (OpenAI) ────────────────────────────────────────────────────
+    clients.append(("Codex CLI", H / ".codex" / "config.json"))
+
+    # ── Continue ──────────────────────────────────────────────────────────────
+    clients.append(("Continue", H / ".continue" / "config.json"))
+
+    # ── Gemini CLI ────────────────────────────────────────────────────────────
+    clients.append(("Gemini CLI", H / ".gemini" / "settings.json"))
+
+    # ── Cline (VS Code extension) ─────────────────────────────────────────────
+    if OS == "darwin":
+        clients.append(("Cline", H / "Library" / "Application Support" / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"))
+    elif OS == "linux":
+        clients.append(("Cline", H / ".config" / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"))
+    elif OS == "win32":
+        appdata = Path(os.environ.get("APPDATA", H / "AppData" / "Roaming"))
+        clients.append(("Cline", appdata / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"))
+
+    return clients
+
+
+def _write_mcp_config(config_path: Path, server_name: str, entry: dict) -> None:
+    """
+    Write the server entry into a JSON config file.
+    Handles the two shapes used across MCP clients:
+      - Standard:  {"mcpServers": {name: entry}}
+      - Zed:       {"context_servers": {name: {"command": ..., "settings": {}}}}
+      - Continue:  {"mcpServers": {name: entry}}  (same as standard)
+    """
+    config: dict = {}
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            config = {}
+
+    name_lower = config_path.parts[-1]
+
+    # Zed uses a different key and schema
+    if "zed" in str(config_path).lower():
+        config.setdefault("context_servers", {})[server_name] = {
+            "command": {
+                "path": entry["command"],
+                "args": entry["args"],
+            },
+            "settings": {},
+        }
+    else:
+        config.setdefault("mcpServers", {})[server_name] = entry
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
 def do_claude_config(base_url: str) -> None:
-    # Derive a nice server name from the URL (e.g. "blackboard-cdu", "blackboard-uq")
-    hostname = base_url.split("//")[-1].split("/")[0]          # e.g. online.cdu.edu.au
+    import os
+
+    # Derive a server name from the URL (e.g. "blackboard-cdu", "blackboard-uq")
+    hostname = base_url.split("//")[-1].split("/")[0]
     parts = hostname.replace("www.", "").split(".")
     uni_slug = next(
         (p for p in reversed(parts) if p not in ("edu", "au", "com", "ac", "uk", "nz", "online", "learn", "lms", "bb")),
@@ -318,29 +407,30 @@ def do_claude_config(base_url: str) -> None:
 
     configured: list[str] = []
     skipped: list[str] = []
+    failed: list[str] = []
 
-    for client_name, config_path in MCP_CLIENTS:
-        # Only configure clients that are actually installed (config dir exists)
+    for client_name, config_path in _get_mcp_clients():
         if not config_path.parent.exists():
             skipped.append(client_name)
             continue
+        try:
+            _write_mcp_config(config_path, server_name, entry)
+            configured.append(client_name)
+        except Exception as exc:
+            failed.append(f"{client_name} ({exc})")
 
-        config: dict = {}
-        if config_path.exists():
-            try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                config = {}
-
-        config.setdefault("mcpServers", {})[server_name] = entry
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        configured.append(client_name)
-
+    console.print()
     if configured:
-        success(f"Server [cyan]{server_name}[/cyan] configured in: {', '.join(configured)}")
+        success(f"Server [cyan]{server_name}[/cyan] added to:")
+        for name in configured:
+            console.print(f"     [green]•[/green] {name}")
     if skipped:
-        info(f"Not installed (skipped): {', '.join(skipped)}")
+        console.print()
+        info(f"Not detected (skipped): {', '.join(skipped)}")
+    if failed:
+        console.print()
+        for f in failed:
+            warn(f"Could not configure: {f}")
     console.print()
     warn("[bold]Restart any configured apps[/bold] to activate the MCP server.")
 
@@ -421,7 +511,7 @@ async def main() -> None:
     # ── Done ─────────────────────────────────────────────────────────────────
     console.print(Panel.fit(
         "[bold green]🎉  All done! Blackboard MCP is ready.[/bold green]\n\n"
-        "[bold]Restart Claude Desktop, then try asking:[/bold]\n\n"
+        "[bold]Restart your AI assistant, then try asking:[/bold]\n\n"
         '  [cyan]"What courses am I enrolled in?"[/cyan]\n'
         '  [cyan]"What assignments are due this week?"[/cyan]\n'
         '  [cyan]"Catch me up on everything in Blackboard"[/cyan]',

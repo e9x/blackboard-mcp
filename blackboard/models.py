@@ -38,7 +38,7 @@ class Course(BaseModel):
     term: Optional[str] = None
     is_available: bool = True
     description: Optional[str] = None
-    url: Optional[str] = None                 # Direct link to the course in Learnline
+    url: Optional[str] = None                 # Direct link to the course in Blackboard
 
 
 class Announcement(BaseModel):

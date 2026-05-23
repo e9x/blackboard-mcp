@@ -1,25 +1,22 @@
 """
-server.py — CDU Learnline MCP Server
+server.py — Blackboard MCP Server
 
-Entry point for the Blackboard MCP server. Registers all student-facing
-tools with FastMCP and connects them to the BlackboardClient.
+MCP server that connects any AI assistant to a student's university
+Blackboard LMS account. Works with Blackboard Ultra and Classic at
+any university worldwide.
+
+Supported platforms: Claude Desktop, Claude Code, Cursor, Windsurf,
+                     Cline, Zed, Continue, Codex CLI, Gemini CLI.
 
 Run directly with:
     python server.py
 
-Or configure in Claude Desktop's config.json:
-    {
-      "mcpServers": {
-        "blackboard-cdu": {
-          "command": "python",
-          "args": ["/path/to/Blackboard MCP/server.py"]
-        }
-      }
-    }
+Or configure in your AI assistant's MCP config. See README.md.
 """
 from __future__ import annotations
 
 import asyncio
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +24,13 @@ from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from blackboard.auth import (
+    LoginTimeoutError,
+    NotConfiguredError,
+    clear_cookie_cache,
+    interactive_login,
+    load_cached_cookies,
+)
 from blackboard.client import BlackboardClient
 
 # ──────────────────────────────────────────────
@@ -36,15 +40,13 @@ from blackboard.client import BlackboardClient
 PROJECT_DIR = Path(__file__).parent
 REPO = "sasindudilshanranwadana/blackboard-mcp"
 _VERSION = (PROJECT_DIR / "VERSION").read_text().strip() if (PROJECT_DIR / "VERSION").exists() else "unknown"
-_update_notice: str | None = None   # set by background check if a new version is available
+_update_notice: str | None = None
 
 
 async def _check_for_updates() -> None:
-    """Background task: compare local VERSION with latest GitHub release tag."""
     global _update_notice
     try:
         async with httpx.AsyncClient(timeout=6) as http:
-            # Check latest commit on main branch
             r = await http.get(
                 f"https://api.github.com/repos/{REPO}/contents/VERSION",
                 headers={"Accept": "application/vnd.github.raw"},
@@ -54,12 +56,11 @@ async def _check_for_updates() -> None:
                 if latest != _VERSION:
                     _update_notice = (
                         f"\n\n---\n"
-                        f"💡 **Blackboard MCP update available!** "
-                        f"(you have `v{_VERSION}`, latest is `v{latest}`)  "
+                        f"💡 **Update available:** you have `v{_VERSION}`, latest is `v{latest}`.  "
                         f"Ask me: _\"Update Blackboard MCP\"_ to install it automatically."
                     )
     except Exception:
-        pass   # silently ignore — never block tool calls for an update check
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -69,29 +70,53 @@ async def _check_for_updates() -> None:
 mcp = FastMCP(
     name="Blackboard MCP",
     instructions=(
-        "You are a helpful assistant with access to the student's university "
-        "Blackboard LMS account. You can look up courses, announcements, assignments, "
-        "grades, and course content. Always present information in a clear, organised way. "
+        "You are a helpful assistant connected to the student's university Blackboard LMS. "
+        "You can look up courses, announcements, assignments, grades, and course content. "
+        "Always present information in a clear, organised way. "
         "When showing due dates, highlight anything due within 3 days. "
-        "When grades are available, calculate percentages and note if something is still pending."
+        "When grades are available, calculate percentages and note if something is still pending. "
+        "If the student has not connected their Blackboard account yet, use the connect_blackboard "
+        "tool to guide them through setup — ask for their university's Blackboard URL first."
     ),
 )
 
-# Lazy-initialised singleton client — created on first tool call
 _client: BlackboardClient | None = None
 _client_lock = asyncio.Lock()
 
 
 async def get_client() -> BlackboardClient:
     """Return the shared BlackboardClient, initialising it on first call."""
+    from blackboard.auth import NotConfiguredError as _NCE
+    from config import settings as _s
+    if not _s.is_configured():
+        raise _NCE("No Blackboard URL is configured.")
     global _client
     async with _client_lock:
         if _client is None:
-            # Fire update check in background — don't await it
-            asyncio.create_task(_check_for_updates())
             _client = BlackboardClient()
             await _client.initialize()
     return _client
+
+
+def _reset_client() -> None:
+    """Force the client to be re-created on the next call (used after reconnect)."""
+    global _client
+    _client = None
+
+
+# ──────────────────────────────────────────────
+#  Not-configured guard
+# ──────────────────────────────────────────────
+
+_NOT_CONFIGURED = (
+    "## 🔗 Connect your Blackboard account first\n\n"
+    "It looks like your university's Blackboard hasn't been connected yet.\n\n"
+    "**To get started, just tell me:**\n"
+    "> *\"Connect my Blackboard — my university URL is https://blackboard.myuniversity.edu\"*\n\n"
+    "Or run the setup wizard in your terminal:\n"
+    "```\npython3 setup.py\n```\n\n"
+    "Once connected, all tools will work automatically."
+)
 
 
 # ──────────────────────────────────────────────
@@ -99,10 +124,8 @@ async def get_client() -> BlackboardClient:
 # ──────────────────────────────────────────────
 
 def _fmt_dt(dt: datetime | None, show_relative: bool = False) -> str:
-    """Format a datetime for display, optionally with a relative label."""
     if dt is None:
         return "No date"
-    # Convert to local-ish display (keep UTC label for clarity)
     s = dt.strftime("%a %d %b %Y, %I:%M %p %Z")
     if show_relative:
         now = datetime.now(timezone.utc)
@@ -129,9 +152,7 @@ def _urgency_emoji(dt: datetime | None) -> str:
     now = datetime.now(timezone.utc)
     diff = (dt - now).days
     if diff < 0:
-        return "⚫"  # overdue
-    if diff == 0:
-        return "🔴"
+        return "⚫"
     if diff <= 1:
         return "🔴"
     if diff <= 3:
@@ -146,19 +167,118 @@ def _urgency_emoji(dt: datetime | None) -> str:
 # ──────────────────────────────────────────────
 
 @mcp.tool()
+async def connect_blackboard(university_blackboard_url: str) -> str:
+    """
+    Connect to your university's Blackboard LMS. Call this first before using
+    any other tool. Opens a browser window so you can log in with your normal
+    university credentials (supports any SSO, Microsoft, Shibboleth, MFA, etc).
+
+    Args:
+        university_blackboard_url: Your university's Blackboard URL.
+            Examples: https://blackboard.myuniversity.edu
+                      https://learn.myuni.edu.au
+                      https://lms.myschool.ac.uk
+    """
+    # Normalise URL
+    url = university_blackboard_url.strip().rstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    if not re.match(r"https?://[a-zA-Z0-9.\-]+", url):
+        return (
+            "❌ That doesn't look like a valid URL.\n\n"
+            "Please provide your university's full Blackboard address, for example:\n"
+            "> `https://blackboard.myuniversity.edu`"
+        )
+
+    # Detect interface (Ultra vs Classic)
+    interface = "ultra"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as http:
+            resp = await http.get(f"{url}/ultra/institution-page")
+            final = str(resp.url)
+            host = url.split("//")[-1].split("/")[0]
+            if "/ultra/" in final and host in final:
+                interface = "ultra"
+            else:
+                interface = "classic"
+    except Exception:
+        pass
+
+    # Write .env
+    env_file = PROJECT_DIR / ".env"
+    env_data: dict[str, str] = {}
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env_data[k.strip()] = v.strip()
+    env_data["BB_BASE_URL"] = url
+    env_data["BB_INTERFACE"] = interface
+    env_file.write_text("\n".join(f"{k}={v}" for k, v in env_data.items()) + "\n")
+
+    # Update the live settings object directly — no module reload needed
+    from config import settings as _settings
+    _settings.base_url = url
+    _settings.interface = interface
+
+    # Reset the cached client so it is rebuilt with the new URL
+    _reset_client()
+
+    # Clear any stale cookies from a previous university
+    clear_cookie_cache()
+
+    iface_label = "Ultra (modern)" if interface == "ultra" else "Classic (legacy)"
+
+    try:
+        cookies = await interactive_login(base_url=url)
+    except LoginTimeoutError:
+        return (
+            "⏰ **Login cancelled** — no cookie was entered.\n\n"
+            f"Please try again: *\"Connect my Blackboard — {url}\"*"
+        )
+    except Exception as exc:
+        return (
+            f"❌ **Login failed:** {exc}\n\n"
+            "Please try again."
+        )
+
+    if not cookies:
+        return (
+            "⚠️ Login appeared to complete but no session cookies were captured.\n\n"
+            "Please try again or run the setup wizard:\n"
+            "```\npython3 setup.py\n```"
+        )
+
+    return (
+        f"## ✅ Blackboard Connected!\n\n"
+        f"**University URL:** `{url}`\n"
+        f"**Interface:** {iface_label}\n"
+        f"**Session:** Active ({len(cookies)} cookies captured)\n\n"
+        f"You're all set! Try asking:\n"
+        f"- *\"What courses am I enrolled in?\"*\n"
+        f"- *\"What assignments are due this week?\"*\n"
+        f"- *\"Catch me up on everything in Blackboard\"*"
+    )
+
+
+@mcp.tool()
 async def get_my_profile() -> str:
     """
     Return the logged-in student's profile: name, student ID, and email.
     Use this to confirm whose account is connected.
     """
-    client = await get_client()
-    profile = await client.get_user_profile()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
 
+    profile = await client.get_user_profile()
     if not profile:
-        return "❌ Could not retrieve your profile. Check that you're logged in correctly."
+        return "❌ Could not retrieve your profile. Try reconnecting: *\"Connect my Blackboard\"*"
 
     lines = [
-        "## 👤 Your CDU Student Profile",
+        "## 👤 Your Student Profile",
         "",
         f"**Name:** {profile.full_name}",
         f"**Username / Student Number:** {profile.username}",
@@ -174,23 +294,23 @@ async def get_my_profile() -> str:
 @mcp.tool()
 async def list_courses() -> str:
     """
-    List all courses (units) the student is currently enrolled in on Blackboard Learnline.
+    List all courses the student is currently enrolled in on Blackboard.
     Shows course name, course code, and term.
     """
-    client = await get_client()
-    courses = await client.get_courses()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
 
+    courses = await client.get_courses()
     if not courses:
         return (
-            "No active courses found on your Learnline account.\n"
-            "This may mean you have no current enrolments, or the session needs refreshing."
+            "No active courses found on your Blackboard account.\n"
+            "This may mean you have no current enrolments, or the session needs refreshing.\n\n"
+            "Try: *\"Reconnect my Blackboard\"*"
         )
 
-    lines = [
-        f"## 📚 Your Enrolled Courses ({len(courses)} total)",
-        "",
-    ]
-
+    lines = [f"## 📚 Your Enrolled Courses ({len(courses)} total)", ""]
     for i, course in enumerate(courses, 1):
         avail = "✅" if course.is_available else "🔒"
         term = f" · {course.term}" if course.term else ""
@@ -202,7 +322,7 @@ async def list_courses() -> str:
             desc = course.description[:200] + "…" if len(course.description) > 200 else course.description
             lines.append(f"_{desc}_")
         if course.url:
-            lines.append(f"[Open in Learnline]({course.url})")
+            lines.append(f"[Open in Blackboard]({course.url})")
         lines.append("")
 
     return "\n".join(lines)
@@ -211,19 +331,19 @@ async def list_courses() -> str:
 @mcp.tool()
 async def get_course_details(course_name_or_code: str) -> str:
     """
-    Get detailed information about a specific course by searching for it by name or code.
+    Get detailed information about a specific course by name or code.
 
     Args:
         course_name_or_code: Part of the course name or code to search for (case-insensitive).
     """
-    client = await get_client()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
+
     courses = await client.get_courses()
     query = course_name_or_code.lower()
-
-    matches = [
-        c for c in courses
-        if query in c.name.lower() or query in c.course_id.lower()
-    ]
+    matches = [c for c in courses if query in c.name.lower() or query in c.course_id.lower()]
 
     if not matches:
         all_names = "\n".join(f"- {c.name} (`{c.course_id}`)" for c in courses)
@@ -234,8 +354,7 @@ async def get_course_details(course_name_or_code: str) -> str:
 
     course = matches[0]
     lines = [
-        f"## 📖 {course.name}",
-        "",
+        f"## 📖 {course.name}", "",
         f"**Course Code:** `{course.course_id}`",
         f"**Blackboard ID:** `{course.id}`",
         f"**Status:** {'Available ✅' if course.is_available else 'Not available 🔒'}",
@@ -247,7 +366,7 @@ async def get_course_details(course_name_or_code: str) -> str:
     if course.description:
         lines.append(f"\n**Description:**\n{course.description}")
     if course.url:
-        lines.append(f"\n[Open in Learnline]({course.url})")
+        lines.append(f"\n[Open in Blackboard]({course.url})")
 
     return "\n".join(lines)
 
@@ -261,7 +380,11 @@ async def get_announcements(course_name_or_code: str | None = None, limit: int =
         course_name_or_code: Filter to a specific course (optional). If omitted, fetches from all courses.
         limit: Max announcements per course (default 5).
     """
-    client = await get_client()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
+
     courses = await client.get_courses()
 
     if course_name_or_code:
@@ -272,18 +395,16 @@ async def get_announcements(course_name_or_code: str | None = None, limit: int =
 
     all_announcements = []
     for course in courses:
-        announcements = await client.get_announcements(course.id, course.name, limit=limit)
-        all_announcements.extend(announcements)
+        anns = await client.get_announcements(course.id, course.name, limit=limit)
+        all_announcements.extend(anns)
 
     if not all_announcements:
         scope = f"**{courses[0].name}**" if len(courses) == 1 else "any of your courses"
         return f"📭 No announcements found in {scope}."
 
-    # Sort by date, newest first
     all_announcements.sort(key=lambda a: a.created or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
     lines = [f"## 📢 Announcements ({len(all_announcements)} found)", ""]
-
     for ann in all_announcements:
         lines.append(f"### {ann.title}")
         lines.append(f"**Course:** {ann.course_name}")
@@ -307,7 +428,11 @@ async def get_assignments(course_name_or_code: str | None = None) -> str:
     Args:
         course_name_or_code: Filter to a specific course (optional).
     """
-    client = await get_client()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
+
     courses = await client.get_courses()
 
     if course_name_or_code:
@@ -324,16 +449,12 @@ async def get_assignments(course_name_or_code: str | None = None) -> str:
     if not all_assignments:
         return "📭 No assignments found."
 
-    # Sort by due date (no date goes to end)
     def sort_key(a):
-        if a.due_date is None:
-            return datetime.max.replace(tzinfo=timezone.utc)
-        return a.due_date
+        return a.due_date if a.due_date else datetime.max.replace(tzinfo=timezone.utc)
 
     all_assignments.sort(key=sort_key)
 
     lines = [f"## 📝 Assignments ({len(all_assignments)} found)", ""]
-
     for a in all_assignments:
         emoji = _urgency_emoji(a.due_date)
         lines.append(f"### {emoji} {a.title}")
@@ -361,20 +482,21 @@ async def get_due_dates(days_ahead: int = 14) -> str:
     Args:
         days_ahead: How many days ahead to look (default 14 = two weeks).
     """
-    client = await get_client()
-    courses = await client.get_courses()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
 
+    courses = await client.get_courses()
     cutoff = datetime.now(timezone.utc) + timedelta(days=days_ahead)
     now = datetime.now(timezone.utc)
 
     upcoming = []
     for course in courses:
-        assignments = await client.get_assignments(course.id, course.name)
-        for a in assignments:
-            if a.due_date and a.due_date >= now and a.due_date <= cutoff:
+        for a in await client.get_assignments(course.id, course.name):
+            # Include overdue, upcoming within window, and undated items
+            if a.due_date is None or a.due_date <= cutoff:
                 upcoming.append(a)
-            elif a.due_date is None:
-                upcoming.append(a)  # include undated items too
 
     if not upcoming:
         return f"🎉 Nothing due in the next {days_ahead} days! Enjoy the break."
@@ -382,12 +504,10 @@ async def get_due_dates(days_ahead: int = 14) -> str:
     upcoming.sort(key=lambda a: a.due_date if a.due_date else datetime.max.replace(tzinfo=timezone.utc))
 
     lines = [
-        f"## ⏰ Upcoming Due Dates — Next {days_ahead} Days",
-        "",
+        f"## ⏰ Upcoming Due Dates — Next {days_ahead} Days", "",
         "| Urgency | Assignment | Course | Due Date |",
         "|---------|-----------|--------|----------|",
     ]
-
     for a in upcoming:
         emoji = _urgency_emoji(a.due_date)
         due_str = _fmt_dt(a.due_date) if a.due_date else "_No date set_"
@@ -399,7 +519,6 @@ async def get_due_dates(days_ahead: int = 14) -> str:
         "",
         "**Key:** 🔴 Due within 24h · 🟠 Within 3 days · 🟡 Within 1 week · 🟢 More than 1 week · ⚫ Overdue",
     ]
-
     return "\n".join(lines)
 
 
@@ -411,11 +530,15 @@ async def get_grades(course_name_or_code: str) -> str:
     Args:
         course_name_or_code: Part of the course name or code to search for.
     """
-    client = await get_client()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
+
     courses = await client.get_courses()
     query = course_name_or_code.lower()
-
     matches = [c for c in courses if query in c.name.lower() or query in c.course_id.lower()]
+
     if not matches:
         all_names = ", ".join(f"`{c.course_id}`" for c in courses)
         return f"No course found matching **'{course_name_or_code}'**.\nYour courses: {all_names}"
@@ -424,10 +547,12 @@ async def get_grades(course_name_or_code: str) -> str:
     grades = await client.get_grades(course.id)
 
     if not grades:
-        return f"📭 No grade entries found for **{course.name}**.\nThis may mean grades haven't been released yet."
+        return (
+            f"📭 No grade entries found for **{course.name}**.\n"
+            "Grades may not have been released yet."
+        )
 
     lines = [f"## 📊 Grades — {course.name}", ""]
-
     graded = [g for g in grades if g.score is not None]
     pending = [g for g in grades if g.score is None]
 
@@ -441,7 +566,6 @@ async def get_grades(course_name_or_code: str) -> str:
             max_s = str(g.max_score) if g.max_score is not None else "—"
             score_s = str(g.score) if g.score is not None else "—"
             status = g.status or "—"
-            # Add emoji based on percentage
             if g.percentage is not None:
                 if g.percentage >= 85:
                     pct = f"🌟 {pct}"
@@ -453,7 +577,6 @@ async def get_grades(course_name_or_code: str) -> str:
                     pct = f"❌ {pct}"
             lines.append(f"| {g.column_name} | {score_s} | {max_s} | {pct} | {status} |")
 
-        # Overall summary
         scores = [(g.score, g.max_score) for g in graded if g.score is not None and g.max_score]
         if scores:
             total_score = sum(s for s, _ in scores)
@@ -480,11 +603,15 @@ async def get_course_content(course_name_or_code: str, folder: str | None = None
         course_name_or_code: Part of the course name or code to search for.
         folder: Optional folder name to look inside (e.g. "Week 3"). If omitted, shows top-level content.
     """
-    client = await get_client()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
+
     courses = await client.get_courses()
     query = course_name_or_code.lower()
-
     matches = [c for c in courses if query in c.name.lower() or query in c.course_id.lower()]
+
     if not matches:
         return f"No course found matching **'{course_name_or_code}'**."
 
@@ -492,7 +619,6 @@ async def get_course_content(course_name_or_code: str, folder: str | None = None
     items = await client.get_course_content(course.id)
 
     if folder:
-        # Find the matching folder and get its children
         folder_query = folder.lower()
         folder_item = next(
             (i for i in items if folder_query in i.title.lower() and i.content_type == "folder"),
@@ -501,7 +627,6 @@ async def get_course_content(course_name_or_code: str, folder: str | None = None
         if folder_item:
             items = await client.get_course_content(course.id, folder_item.id)
         else:
-            # Show available folders as a hint
             folders = [i for i in items if i.content_type == "folder"]
             folder_list = "\n".join(f"- 📁 {f.title}" for f in folders) or "_No folders found_"
             return (
@@ -513,15 +638,9 @@ async def get_course_content(course_name_or_code: str, folder: str | None = None
         return f"No content found in **{course.name}**."
 
     type_icons = {
-        "folder": "📁",
-        "document": "📄",
-        "file": "📎",
-        "assignment": "📝",
-        "link": "🔗",
-        "video": "🎬",
-        "discussion": "💬",
-        "page": "📃",
-        "item": "•",
+        "folder": "📁", "document": "📄", "file": "📎",
+        "assignment": "📝", "link": "🔗", "video": "🎬",
+        "discussion": "💬", "page": "📃", "item": "•",
     }
 
     level = f" > {folder}" if folder else ""
@@ -548,9 +667,11 @@ async def summarize_activity() -> str:
     recent announcements, upcoming deadlines, and pending assignments.
     Perfect for a quick 'catch me up' overview.
     """
-    client = await get_client()
+    try:
+        client = await get_client()
+    except NotConfiguredError:
+        return _NOT_CONFIGURED
 
-    # Fetch everything concurrently
     profile_task = asyncio.create_task(client.get_user_profile())
     courses_task = asyncio.create_task(client.get_courses())
 
@@ -558,32 +679,30 @@ async def summarize_activity() -> str:
     courses = await courses_task
 
     if not courses:
-        return "No courses found on your Learnline account."
+        return (
+            "No courses found on your Blackboard account.\n\n"
+            "If you've just connected, it may take a moment. Try again shortly.\n"
+            "If this keeps happening, try reconnecting: *\"Connect my Blackboard\"*"
+        )
 
-    # Fetch announcements and assignments for all courses concurrently
     ann_tasks = [client.get_announcements(c.id, c.name, limit=2) for c in courses]
     asgn_tasks = [client.get_assignments(c.id, c.name) for c in courses]
 
-    ann_results = await asyncio.gather(*ann_tasks)
-    asgn_results = await asyncio.gather(*asgn_tasks)
+    ann_results = await asyncio.gather(*ann_tasks, return_exceptions=True)
+    asgn_results = await asyncio.gather(*asgn_tasks, return_exceptions=True)
 
-    all_announcements = []
-    for anns in ann_results:
-        all_announcements.extend(anns)
-
-    all_assignments = []
-    for asgns in asgn_results:
-        all_assignments.extend(asgns)
+    all_announcements = [a for r in ann_results if isinstance(r, list) for a in r]
+    all_assignments = [a for r in asgn_results if isinstance(r, list) for a in r]
 
     now = datetime.now(timezone.utc)
     cutoff_7 = now + timedelta(days=7)
     cutoff_14 = now + timedelta(days=14)
 
-    urgent = [a for a in all_assignments if a.due_date and a.due_date <= cutoff_7]
+    urgent = sorted(
+        [a for a in all_assignments if a.due_date and a.due_date <= cutoff_7],
+        key=lambda a: a.due_date,
+    )
     upcoming = [a for a in all_assignments if a.due_date and cutoff_7 < a.due_date <= cutoff_14]
-
-
-    urgent.sort(key=lambda a: a.due_date)
     all_announcements.sort(
         key=lambda a: a.created or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
@@ -591,14 +710,13 @@ async def summarize_activity() -> str:
 
     name = profile.given_name if profile else "Student"
     lines = [
-        f"# 📋 Learnline Summary for {name}",
+        f"# 📋 Blackboard Summary for {name}",
         f"_{now.strftime('%A, %d %B %Y')}_",
         "",
         f"**Enrolled Courses:** {len(courses)}",
         "",
     ]
 
-    # ── Urgent deadlines ──
     if urgent:
         lines.append("## 🚨 Due This Week")
         lines.append("")
@@ -607,7 +725,6 @@ async def summarize_activity() -> str:
             lines.append(f"- {emoji} **{a.title}** — _{a.course_name}_ — {_fmt_dt(a.due_date, show_relative=True)}")
         lines.append("")
 
-    # ── Coming up ──
     if upcoming:
         lines.append("## 📅 Coming Up (Next 2 Weeks)")
         lines.append("")
@@ -615,7 +732,6 @@ async def summarize_activity() -> str:
             lines.append(f"- 🟢 **{a.title}** — _{a.course_name}_ — {_fmt_dt(a.due_date)}")
         lines.append("")
 
-    # ── Recent announcements ──
     recent_anns = all_announcements[:5]
     if recent_anns:
         lines.append("## 📢 Recent Announcements")
@@ -629,7 +745,6 @@ async def summarize_activity() -> str:
                 lines.append(snippet)
             lines.append("")
 
-    # ── Nothing urgent ──
     if not urgent and not upcoming:
         lines.append("## ✨ No Urgent Deadlines")
         lines.append("_You're all caught up! No assignments due in the next 2 weeks._")
@@ -651,11 +766,9 @@ async def update_server() -> str:
     """
     Update the Blackboard MCP server to the latest version from GitHub.
     Pulls new code and reinstalls any updated dependencies automatically.
-    Use this when a new version is available.
     """
     global _update_notice
     try:
-        # git pull
         pull = subprocess.run(
             ["git", "-C", str(PROJECT_DIR), "pull", "--ff-only"],
             capture_output=True, text=True, timeout=30,
@@ -666,7 +779,6 @@ async def update_server() -> str:
         pull_out = pull.stdout.strip()
         already_latest = "Already up to date" in pull_out
 
-        # pip install -r requirements.txt (using same python as this process)
         import sys
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "-r",
@@ -676,23 +788,17 @@ async def update_server() -> str:
 
         new_version = (PROJECT_DIR / "VERSION").read_text().strip() \
             if (PROJECT_DIR / "VERSION").exists() else "unknown"
-        _update_notice = None   # clear the notice
+        _update_notice = None
 
         if already_latest:
-            return (
-                f"✅ **Already on the latest version** (`v{new_version}`)\n"
-                "No changes were needed."
-            )
+            return f"✅ **Already on the latest version** (`v{new_version}`)\nNo changes were needed."
 
-        lines = [
-            f"## ✅ Blackboard MCP Updated to `v{new_version}`",
-            "",
+        return "\n".join([
+            f"## ✅ Blackboard MCP Updated to `v{new_version}`", "",
             "**Changes pulled:**",
-            f"```\n{pull_out}\n```",
-            "",
-            "⚠️ **Restart Claude Desktop** (or your AI client) to load the new version.",
-        ]
-        return "\n".join(lines)
+            f"```\n{pull_out}\n```", "",
+            "⚠️ **Restart your AI assistant** to load the new version.",
+        ])
 
     except subprocess.TimeoutExpired:
         return "❌ Update timed out. Please run `git pull` manually in the install directory."
@@ -705,4 +811,9 @@ async def update_server() -> str:
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Fire update check once at startup in the background — never blocks tool calls
+    async def _startup() -> None:
+        asyncio.create_task(_check_for_updates())
+
+    asyncio.run(_startup())
     mcp.run(transport="stdio")

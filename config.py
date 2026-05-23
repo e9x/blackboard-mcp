@@ -1,11 +1,15 @@
 """
-config.py — Optional settings for Blackboard MCP.
+config.py — Settings for Blackboard MCP.
 
-Most settings have sensible defaults.
-You only need a .env file if you want to override the Learnline URL
-or point to a custom session cache location.
+Works with ANY university that uses Blackboard Learn (Ultra or Classic).
 
-Authentication is handled by setup.py (no credentials needed here).
+On first use, run the setup wizard:
+    python3 setup.py
+
+Or let the MCP server guide you — just ask your AI assistant:
+    "Connect my Blackboard account"
+
+Settings are stored in a .env file in this directory.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,18 +22,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # CDU Learnline base URL
-    base_url: str = "https://online.cdu.edu.au"
+    # Your university's Blackboard URL — set by the setup wizard or connect_blackboard tool.
+    # Example: https://blackboard.myuniversity.edu
+    # Leave empty to be guided through setup on first use.
+    base_url: str = ""
 
-    # Blackboard interface version: 'ultra' (default) or 'classic'
-    # Detected automatically by setup.py and saved to .env
+    # Blackboard interface version: 'ultra' (default) or 'classic'.
+    # Auto-detected by the setup wizard.
     interface: str = "ultra"
 
-    # Where to cache session cookies between server restarts
+    # Where to cache session cookies between server restarts.
+    # Stored in your home directory, never inside the repo.
     session_cache: str = "~/.bb_mcp_session.json"
 
-    # Set to true to suppress browser window during auto-login
+    # Set to true to suppress the browser window during auto-login (Keychain mode).
     headless: bool = True
+
+    def is_configured(self) -> bool:
+        """Return True if a Blackboard URL has been set."""
+        return bool(self.base_url and self.base_url.startswith("http"))
 
 
 settings = Settings()

@@ -1,1 +1,1 @@
-# Blackboard MCP — CDU Learnline integration package
+# Blackboard MCP — universal Blackboard LMS integration package
