@@ -26,7 +26,9 @@ import sys
 from pathlib import Path
 
 # ── Auto-bootstrap: create .venv and re-exec inside it if needed ─────────────
-if os.environ.get("_BB_MCP_VENV") != "1":
+# Only runs when setup.py is executed as a script. When imported as a module
+# (e.g. by tests or CI), the bootstrap is skipped entirely.
+if __name__ == "__main__" and os.environ.get("_BB_MCP_VENV") != "1":
     _HERE = Path(__file__).parent.resolve()
     _VENV = _HERE / ".venv"
     _VENV_PY = _VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python3")
