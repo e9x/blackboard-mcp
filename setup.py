@@ -320,8 +320,11 @@ def _get_mcp_clients() -> list[tuple[str, Path]]:
     else:  # Linux / WSL
         clients.append(("Claude Desktop", H / ".config" / "Claude" / "claude_desktop_config.json"))
 
-    # ── Claude Code (CLI) — single-file config at ~/.claude.json ─────────────
-    clients.append(("Claude Code", H / ".claude.json"))
+    # NOTE: Claude Code and Codex CLI are intentionally NOT auto-configured.
+    #   - Claude Code stores MCPs per-project inside ~/.claude.json, not at root;
+    #     the correct way to add it is:  claude mcp add blackboard <cmd> --scope user
+    #   - Codex CLI uses TOML at ~/.codex/config.toml, not JSON
+    # Both are surfaced as manual instructions after the wizard finishes.
 
     # ── Cursor ────────────────────────────────────────────────────────────────
     clients.append(("Cursor", H / ".cursor" / "mcp.json"))
@@ -334,9 +337,6 @@ def _get_mcp_clients() -> list[tuple[str, Path]]:
         clients.append(("Zed", H / "Library" / "Application Support" / "Zed" / "settings.json"))
     elif OS == "linux":
         clients.append(("Zed", H / ".config" / "zed" / "settings.json"))
-
-    # ── Codex CLI (OpenAI) ────────────────────────────────────────────────────
-    clients.append(("Codex CLI", H / ".codex" / "config.json"))
 
     # ── Continue ──────────────────────────────────────────────────────────────
     clients.append(("Continue", H / ".continue" / "config.json"))
@@ -431,6 +431,18 @@ def do_claude_config(base_url: str) -> None:
             warn(f"Could not configure: {f}")
     console.print()
     warn("[bold]Restart any configured apps[/bold] to activate the MCP server.")
+
+    # Surface manual-only clients that we can't safely auto-configure.
+    console.print()
+    console.print("[bold]Manual setup for Claude Code (CLI):[/bold]")
+    console.print(f"  [dim]$[/dim] claude mcp add {server_name} \\\n"
+                  f"      --scope user \\\n"
+                  f"      -- {PYTHON} {PROJECT_DIR / 'server.py'}")
+    console.print()
+    console.print("[bold]Manual setup for Codex CLI:[/bold]  add this to [cyan]~/.codex/config.toml[/cyan]:")
+    console.print(f"  [dim][mcp_servers.{server_name}][/dim]")
+    console.print(f'  [dim]command = "{PYTHON}"[/dim]')
+    console.print(f'  [dim]args = ["{PROJECT_DIR / "server.py"}"][/dim]')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

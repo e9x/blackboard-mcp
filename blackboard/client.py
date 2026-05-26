@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -175,7 +176,11 @@ class BlackboardClient:
                         return resp.json()
                 return None
             except Exception as exc:
-                print(f"[client] API error on {path}: {exc}", file=sys.stderr)
+                # Many universities restrict the public REST API to staff —
+                # 401/403 + transport errors are expected; we fall back to
+                # HTML scraping. Only log at DEBUG to avoid noisy stderr.
+                if os.environ.get("BB_MCP_DEBUG"):
+                    print(f"[client] API error on {path}: {exc}", file=sys.stderr)
                 return None
 
     async def _web_get(self, path: str, params: dict | None = None) -> BeautifulSoup | None:
@@ -186,7 +191,8 @@ class BlackboardClient:
             if resp.status_code == 200:
                 return BeautifulSoup(resp.text, "html.parser")
         except Exception as exc:
-            print(f"[client] Web fetch error on {path}: {exc}", file=sys.stderr)
+            if os.environ.get("BB_MCP_DEBUG"):
+                print(f"[client] Web fetch error on {path}: {exc}", file=sys.stderr)
         return None
 
     # ─────────────────────────────────────────────────────────────
@@ -202,13 +208,14 @@ class BlackboardClient:
 
         data = await self._api_get("/users/me")
         if data and isinstance(data, dict):
-            name = data.get("name", {})
+            name = data.get("name") or {}
+            contact = data.get("contact") or {}
             self._user = UserProfile(
                 id=data.get("id", ""),
                 username=data.get("userName", ""),
-                given_name=name.get("given", ""),
-                family_name=name.get("family", ""),
-                email=data.get("contact", {}).get("email") if isinstance(data.get("contact"), dict) else None,
+                given_name=name.get("given", "") if isinstance(name, dict) else "",
+                family_name=name.get("family", "") if isinstance(name, dict) else "",
+                email=contact.get("email") if isinstance(contact, dict) else None,
                 student_id=data.get("studentId"),
             )
             return self._user

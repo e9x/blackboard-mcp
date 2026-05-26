@@ -183,7 +183,9 @@ async def connect_blackboard(university_blackboard_url: str) -> str:
     if not url.startswith("http"):
         url = "https://" + url
 
-    if not re.match(r"https?://[a-zA-Z0-9.\-]+", url):
+    # Strict URL validation — anchored, no whitespace/newlines, only safe URL chars.
+    # Prevents .env line injection via crafted input like "https://x.edu\nBB_FOO=bar".
+    if not re.fullmatch(r"https?://[a-zA-Z0-9.\-]+(:\d+)?(/[a-zA-Z0-9._\-/]*)?", url):
         return (
             "❌ That doesn't look like a valid URL.\n\n"
             "Please provide your university's full Blackboard address, for example:\n"
