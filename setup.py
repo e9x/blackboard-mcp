@@ -450,7 +450,11 @@ def _write_mcp_config(config_path: Path, server_name: str, entry: dict) -> None:
 
     # Zed uses a different key and schema
     if "zed" in str(config_path).lower():
-        config.setdefault("context_servers", {})[server_name] = {
+        servers = config.setdefault("context_servers", {})
+        # Migrate: remove any legacy "blackboard-<slug>" entries from previous versions
+        for stale in [k for k in list(servers) if k.startswith("blackboard-")]:
+            del servers[stale]
+        servers[server_name] = {
             "command": {
                 "path": entry["command"],
                 "args": entry["args"],
@@ -458,21 +462,20 @@ def _write_mcp_config(config_path: Path, server_name: str, entry: dict) -> None:
             "settings": {},
         }
     else:
-        config.setdefault("mcpServers", {})[server_name] = entry
+        servers = config.setdefault("mcpServers", {})
+        # Migrate: remove any legacy "blackboard-<slug>" entries from previous versions
+        for stale in [k for k in list(servers) if k.startswith("blackboard-")]:
+            del servers[stale]
+        servers[server_name] = entry
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
 def do_claude_config(base_url: str) -> None:
-    # Derive a server name from the URL (e.g. "blackboard-cdu", "blackboard-uq")
-    hostname = base_url.split("//")[-1].split("/")[0]
-    parts = hostname.replace("www.", "").split(".")
-    uni_slug = next(
-        (p for p in reversed(parts) if p not in ("edu", "au", "com", "ac", "uk", "nz", "online", "learn", "lms", "bb")),
-        parts[0],
-    )
-    server_name = f"blackboard-{uni_slug}"
+    # Universal server name — same for every user, every university.
+    # The URL is in .env, so there's no need to leak the school name here.
+    server_name = "blackboard"
 
     entry = {
         "command": PYTHON,
