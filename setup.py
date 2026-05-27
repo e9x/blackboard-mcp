@@ -100,6 +100,56 @@ def error_msg(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  TTY-safe input — handles piped install (curl | bash) and other non-TTY runs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Populated from CLI args at startup. When set, prompts use these instead of
+# blocking on stdin — makes setup.py fully scriptable.
+_CLI_ARGS: dict = {"url": None, "yes": False, "no_keychain": False}
+
+
+def _stdin_is_tty() -> bool:
+    """True if stdin is a real terminal (not a pipe / heredoc / null)."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def safe_prompt(question: str, default: str | None = None) -> str:
+    """Prompt the user, returning `default` if stdin is closed or not a TTY."""
+    if not _stdin_is_tty():
+        if default is None:
+            error_msg(
+                "This wizard needs a real terminal but stdin is a pipe.\n"
+                "  • If you ran `curl ... | bash`, re-run with: "
+                "`bash <(curl -fsSL <url>)` so prompts work,\n"
+                "  • Or pass values non-interactively: "
+                "`python3 setup.py --url https://your.uni.edu --yes`"
+            )
+            sys.exit(2)
+        return default
+    try:
+        return Prompt.ask(question, default=default) if default is not None \
+            else Prompt.ask(question)
+    except (EOFError, KeyboardInterrupt):
+        if default is not None:
+            return default
+        error_msg("Input closed unexpectedly. Aborting.")
+        sys.exit(2)
+
+
+def safe_confirm(question: str, default: bool = False) -> bool:
+    """Confirm prompt with a TTY-safe default fallback."""
+    if not _stdin_is_tty():
+        return default
+    try:
+        return Confirm.ask(question, default=default)
+    except (EOFError, KeyboardInterrupt):
+        return default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Step 1 — University URL + interface detection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -108,28 +158,43 @@ async def do_university_setup() -> tuple[str, str]:
     Ask for the Blackboard URL, detect interface (Ultra/Classic), save to .env.
     Returns (base_url, interface) where interface is 'ultra' or 'classic'.
     """
-    # Check if already configured
-    existing_url = _read_env_value("BB_BASE_URL")
-    if existing_url:
-        console.print(f"  Current Blackboard URL: [cyan]{existing_url}[/cyan]")
-        change = Confirm.ask("  Change it?", default=False)
-        if not change:
-            interface = _read_env_value("BB_INTERFACE") or "ultra"
-            return existing_url, interface
-
-    console.print("  Enter your university's Blackboard URL.")
-    console.print("  [dim]Examples:  https://blackboard.myuniversity.edu  |  https://learn.myuni.edu.au[/dim]")
-    console.print()
-
-    while True:
-        raw = Prompt.ask("  [bold]Blackboard URL[/bold]").strip().rstrip("/")
+    # ── 1) CLI override (--url) takes precedence over everything ──────────
+    if _CLI_ARGS.get("url"):
+        raw = _CLI_ARGS["url"].strip().rstrip("/")
         if not raw.startswith("http"):
             raw = "https://" + raw
-        # Basic URL validation
-        if re.match(r"https?://[a-zA-Z0-9.\-]+", raw):
-            base_url = raw
-            break
-        warn("That doesn't look like a valid URL. Please try again.")
+        if not re.fullmatch(r"https?://[a-zA-Z0-9.\-]+(:\d+)?(/[a-zA-Z0-9._\-/]*)?", raw):
+            error_msg(f"--url '{raw}' is not a valid URL.")
+            sys.exit(2)
+        base_url = raw
+        console.print(f"  Using URL from --url flag: [cyan]{base_url}[/cyan]")
+
+    else:
+        # ── 2) Already configured — offer to keep ─────────────────────────
+        existing_url = _read_env_value("BB_BASE_URL")
+        if existing_url and re.fullmatch(
+            r"https?://[a-zA-Z0-9.\-]+(:\d+)?(/[a-zA-Z0-9._\-/]*)?", existing_url
+        ):
+            console.print(f"  Current Blackboard URL: [cyan]{existing_url}[/cyan]")
+            change = safe_confirm("  Change it?", default=False)
+            if not change:
+                interface = _read_env_value("BB_INTERFACE") or "ultra"
+                return existing_url, interface
+
+        console.print("  Enter your university's Blackboard URL.")
+        console.print("  [dim]Examples:  https://blackboard.myuniversity.edu  |  https://learn.myuni.edu.au[/dim]")
+        console.print()
+
+        # ── 3) Interactive prompt with strict validation ──────────────────
+        while True:
+            raw = safe_prompt("  [bold]Blackboard URL[/bold]").strip().rstrip("/")
+            if not raw.startswith("http"):
+                raw = "https://" + raw
+            # Strict: anchored, no whitespace/newlines (prevents .env injection)
+            if re.fullmatch(r"https?://[a-zA-Z0-9.\-]+(:\d+)?(/[a-zA-Z0-9._\-/]*)?", raw):
+                base_url = raw
+                break
+            warn("That doesn't look like a valid URL. Please try again.")
 
     console.print()
     info(f"Detecting Blackboard interface at [cyan]{base_url}[/cyan] ...")
@@ -269,15 +334,23 @@ def do_keychain() -> None:
     info("Password stored by OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret Service).")
     console.print()
 
-    save = Confirm.ask(
-        "  Save password to Keychain for fully silent relogin? (No = browser reopens when needed)",
-        default=False,
-    )
+    # Honour --no-keychain / --yes flags first; otherwise prompt (TTY-safe).
+    if _CLI_ARGS.get("no_keychain") or _CLI_ARGS.get("yes"):
+        save = False
+    else:
+        save = safe_confirm(
+            "  Save password to Keychain for fully silent relogin? (No = browser reopens when needed)",
+            default=False,
+        )
 
     if save:
         console.print()
-        username = Prompt.ask("  [bold]Username / Student Number[/bold]")
-        password = getpass.getpass("  Password (hidden): ")
+        username = safe_prompt("  [bold]Username / Student Number[/bold]")
+        try:
+            password = getpass.getpass("  Password (hidden): ")
+        except EOFError:
+            warn("No password entered — skipping keychain save.")
+            return
 
         from blackboard.auth import save_credentials_to_keychain
         ok = save_credentials_to_keychain(username.strip(), password.strip())
@@ -320,11 +393,15 @@ def _get_mcp_clients() -> list[tuple[str, Path]]:
     else:  # Linux / WSL
         clients.append(("Claude Desktop", H / ".config" / "Claude" / "claude_desktop_config.json"))
 
-    # NOTE: Claude Code and Codex CLI are intentionally NOT auto-configured.
-    #   - Claude Code stores MCPs per-project inside ~/.claude.json, not at root;
-    #     the correct way to add it is:  claude mcp add blackboard <cmd> --scope user
-    #   - Codex CLI uses TOML at ~/.codex/config.toml, not JSON
-    # Both are surfaced as manual instructions after the wizard finishes.
+    # ── Claude Code (CLI) — top-level mcpServers in ~/.claude.json works ─────
+    # Verified empirically: writing {"mcpServers": {...}} at the top level of
+    # ~/.claude.json is picked up by Claude Code as a user-scope server, even
+    # though the file also stores per-project state.
+    clients.append(("Claude Code", H / ".claude.json"))
+
+    # NOTE: Codex CLI is intentionally NOT auto-configured.
+    # It uses TOML at ~/.codex/config.toml (not JSON); surfaced as manual
+    # instructions at end of wizard.
 
     # ── Cursor ────────────────────────────────────────────────────────────────
     clients.append(("Cursor", H / ".cursor" / "mcp.json"))
@@ -434,11 +511,6 @@ def do_claude_config(base_url: str) -> None:
 
     # Surface manual-only clients that we can't safely auto-configure.
     console.print()
-    console.print("[bold]Manual setup for Claude Code (CLI):[/bold]")
-    console.print(f"  [dim]$[/dim] claude mcp add {server_name} \\\n"
-                  f"      --scope user \\\n"
-                  f"      -- {PYTHON} {PROJECT_DIR / 'server.py'}")
-    console.print()
     console.print("[bold]Manual setup for Codex CLI:[/bold]  add this to [cyan]~/.codex/config.toml[/cyan]:")
     console.print(f"  [dim][mcp_servers.{server_name}][/dim]")
     console.print(f'  [dim]command = "{PYTHON}"[/dim]')
@@ -465,7 +537,41 @@ def handle_clear_keychain() -> None:
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_cli_args() -> None:
+    """Populate _CLI_ARGS from sys.argv. Lightweight — no argparse dep needed."""
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--url" and i + 1 < len(args):
+            _CLI_ARGS["url"] = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--url="):
+            _CLI_ARGS["url"] = a.split("=", 1)[1]
+        elif a in ("-y", "--yes"):
+            _CLI_ARGS["yes"] = True
+        elif a == "--no-keychain":
+            _CLI_ARGS["no_keychain"] = True
+        elif a in ("-h", "--help"):
+            print(
+                "Blackboard MCP setup\n\n"
+                "Usage: python3 setup.py [options]\n\n"
+                "Options:\n"
+                "  --url <URL>        Your university Blackboard URL (skips prompt)\n"
+                "  -y, --yes          Accept all default prompts (non-interactive)\n"
+                "  --no-keychain      Skip the keychain save step\n"
+                "  --reset            Clear saved cookies and keychain creds\n"
+                "  --clear-keychain   Same as --reset\n"
+                "  -h, --help         Show this help"
+            )
+            sys.exit(0)
+        i += 1
+
+
 async def main() -> None:
+    _parse_cli_args()
+
     if "--clear-keychain" in sys.argv or "--reset" in sys.argv:
         handle_clear_keychain()
         return

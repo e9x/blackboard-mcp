@@ -136,7 +136,22 @@ info "  • Open your browser — log in as you normally would"
 info "  • Configure your AI assistants automatically"
 echo ""
 
-"${PYTHON}" "${INSTALL_DIR}/setup.py"
+# When installed via `curl ... | bash`, this script's stdin is the pipe,
+# not the terminal — so interactive prompts would silently read garbage.
+# Redirect setup.py's stdin from /dev/tty so the wizard talks to the user
+# directly. Fall back to no redirect if /dev/tty isn't available.
+if [ -r /dev/tty ]; then
+  "${PYTHON}" "${INSTALL_DIR}/setup.py" < /dev/tty
+else
+  warn "No TTY available — running setup.py non-interactively."
+  warn "Pass --url <your blackboard URL> via the installer to skip the prompt:"
+  warn "  BLACKBOARD_URL=https://your.uni.edu bash install.sh"
+  if [ -n "${BLACKBOARD_URL:-}" ]; then
+    "${PYTHON}" "${INSTALL_DIR}/setup.py" --url "${BLACKBOARD_URL}" --yes
+  else
+    "${PYTHON}" "${INSTALL_DIR}/setup.py"
+  fi
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
